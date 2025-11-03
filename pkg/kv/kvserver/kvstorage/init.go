@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -246,29 +247,7 @@ func ReadStoreIdent(ctx context.Context, eng storage.Engine) (roachpb.StoreIdent
 func IterateRangeDescriptorsFromDisk(
 	ctx context.Context, reader storage.Reader, fn func(desc roachpb.RangeDescriptor) error,
 ) error {
-	return iterateRangeDescriptorsFromDiskHelper(ctx, reader, fn, buildutil.CrdbTestBuild)
-}
-
-// IterateRangeDescriptorsFromCheckpoint is like IterateRangeDescriptorsFromDisk
-// except it is intended to be used when reading from checkpoints. Checkpoints
-// do not correspond to full stores, and as such, certain invariant checks do
-// not hold for them.
-func IterateRangeDescriptorsFromCheckpoint(
-	ctx context.Context, reader storage.Reader, fn func(desc roachpb.RangeDescriptor) error,
-) error {
-	return iterateRangeDescriptorsFromDiskHelper(ctx, reader, fn, false /* performInvariantChecks */)
-}
-
-// iterateRangeDescriptorsFromDisk performs the actual heavy lifting of reading
-// range descriptors from the supplied storage.Reader. The caller may specify
-// whether or not invariant checks should be performed.
-func iterateRangeDescriptorsFromDiskHelper(
-	ctx context.Context,
-	reader storage.Reader,
-	fn func(desc roachpb.RangeDescriptor) error,
-	performInvariantChecks bool,
-) error {
-	log.KvExec.Info(ctx, "beginning range descriptor iteration")
+	log.Info(ctx, "beginning range descriptor iteration")
 
 	// We are going to find all range descriptor keys. This code is equivalent to
 	// using MVCCIterate on all range-local keys in Inconsistent mode and with
@@ -298,7 +277,7 @@ func iterateRangeDescriptorsFromDiskHelper(
 		const reportPeriod = 10 * time.Second
 		if timeutil.Since(lastReportTime) >= reportPeriod {
 			stats := iter.Stats().Stats
-			log.KvExec.Infof(ctx, "range descriptor iteration in progress: %d range descriptors, %d intents, %d tombstones; stats: %s",
+			log.Infof(ctx, "range descriptor iteration in progress: %d range descriptors, %d intents, %d tombstones; stats: %s",
 				descriptorCount, intentCount, tombstoneCount, stats.String())
 		}
 
@@ -318,12 +297,9 @@ func iterateRangeDescriptorsFromDiskHelper(
 				iter.SeekGE(storage.MVCCKey{Key: keys.RangeDescriptorKey(keys.MustAddr(startKey))})
 			} else {
 				// This case shouldn't happen in practice: we have a key that isn't
-				// associated with any range descriptor. However, when reading from
-				// checkpoints (incomplete stores), this can happen because checkpoints
-				// only guarantee to include specific key spans and may have arbitrary
-				// keys outside those spans.
-				if performInvariantChecks {
-					return errors.AssertionFailedf("range local key %s outside of a known range", key.Key)
+				// associated with any range descriptor.
+				if buildutil.CrdbTestBuild {
+					panic(errors.AssertionFailedf("range local key %s outside of a known range", key.Key))
 				}
 				iter.NextKey()
 			}
@@ -395,7 +371,7 @@ func iterateRangeDescriptorsFromDiskHelper(
 	}
 
 	stats := iter.Stats().Stats
-	log.KvExec.Infof(ctx, "range descriptor iteration done: %d range descriptors, %d intents, %d tombstones; stats: %s",
+	log.Infof(ctx, "range descriptor iteration done: %d range descriptors, %d intents, %d tombstones; stats: %s",
 		descriptorCount, intentCount, tombstoneCount, stats.String())
 	return nil
 }
@@ -412,8 +388,8 @@ type Replica struct {
 }
 
 // ID returns the FullReplicaID.
-func (r Replica) ID() roachpb.FullReplicaID {
-	return roachpb.FullReplicaID{
+func (r Replica) ID() storage.FullReplicaID {
+	return storage.FullReplicaID{
 		RangeID:   r.RangeID,
 		ReplicaID: r.ReplicaID,
 	}
@@ -427,12 +403,9 @@ func (r Replica) Load(
 		ReplicaID: r.ReplicaID,
 		hardState: r.hardState,
 	}
-	sl := MakeStateLoader(r.Desc.RangeID)
+	sl := stateloader.Make(r.Desc.RangeID)
 	var err error
-	if ls.TruncState, err = sl.LoadRaftTruncatedState(ctx, eng); err != nil {
-		return LoadedReplicaState{}, err
-	}
-	if ls.LastEntryID, err = sl.LoadLastEntryID(ctx, eng, ls.TruncState); err != nil {
+	if ls.LastIndex, err = sl.LoadLastIndex(ctx, eng); err != nil {
 		return LoadedReplicaState{}, err
 	}
 	if ls.ReplState, err = sl.Load(ctx, eng, r.Desc); err != nil {
@@ -514,7 +487,7 @@ func loadReplicas(ctx context.Context, eng storage.Engine) ([]Replica, error) {
 			return keys.RaftReplicaIDKey(rangeID)
 		}, &msg, func(rangeID roachpb.RangeID) error {
 			if logEvery.ShouldLog() && i > 0 { // only log if slow
-				log.KvExec.Infof(ctx, "loaded replica ID for %d/%d replicas", i, len(s))
+				log.Infof(ctx, "loaded replica ID for %d/%d replicas", i, len(s))
 			}
 			i++
 			s.setReplicaID(rangeID, msg.ReplicaID)
@@ -522,7 +495,7 @@ func loadReplicas(ctx context.Context, eng storage.Engine) ([]Replica, error) {
 		}); err != nil {
 			return nil, err
 		}
-		log.KvExec.Infof(ctx, "loaded replica ID for %d/%d replicas", len(s), len(s))
+		log.Infof(ctx, "loaded replica ID for %d/%d replicas", len(s), len(s))
 
 		logEvery = log.Every(10 * time.Second)
 		i = 0
@@ -531,7 +504,7 @@ func loadReplicas(ctx context.Context, eng storage.Engine) ([]Replica, error) {
 			return keys.RaftHardStateKey(rangeID)
 		}, &hs, func(rangeID roachpb.RangeID) error {
 			if logEvery.ShouldLog() && i > 0 { // only log if slow
-				log.KvExec.Infof(ctx, "loaded Raft state for %d/%d replicas", i, len(s))
+				log.Infof(ctx, "loaded Raft state for %d/%d replicas", i, len(s))
 			}
 			i++
 			s.setHardState(rangeID, hs)
@@ -539,7 +512,7 @@ func loadReplicas(ctx context.Context, eng storage.Engine) ([]Replica, error) {
 		}); err != nil {
 			return nil, err
 		}
-		log.KvExec.Infof(ctx, "loaded Raft state for %d/%d replicas", len(s), len(s))
+		log.Infof(ctx, "loaded Raft state for %d/%d replicas", len(s), len(s))
 	}
 	sl := make([]Replica, 0, len(s))
 	for _, repl := range s {
@@ -566,7 +539,7 @@ func LoadAndReconcileReplicas(ctx context.Context, eng storage.Engine) ([]Replic
 	if err != nil {
 		return nil, err
 	}
-	log.KvExec.Infof(ctx, "loaded %d replicas", len(sl))
+	log.Infof(ctx, "loaded %d replicas", len(sl))
 
 	// Check invariants.
 	//
@@ -576,7 +549,7 @@ func LoadAndReconcileReplicas(ctx context.Context, eng storage.Engine) ([]Replic
 		// Log progress regularly, but not for the first replica (we only want to
 		// log when this is slow). The last replica is logged after iteration.
 		if logEvery.ShouldLog() && i > 0 {
-			log.KvExec.Infof(ctx, "verified %d/%d replicas", i, len(sl))
+			log.Infof(ctx, "verified %d/%d replicas", i, len(sl))
 		}
 
 		// INVARIANT: a Replica always has a replica ID.
@@ -597,7 +570,7 @@ func LoadAndReconcileReplicas(ctx context.Context, eng storage.Engine) ([]Replic
 			}
 		}
 	}
-	log.KvExec.Infof(ctx, "verified %d/%d replicas", len(sl), len(sl))
+	log.Infof(ctx, "verified %d/%d replicas", len(sl), len(sl))
 
 	return sl, nil
 }
