@@ -16,9 +16,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -248,7 +248,7 @@ func (bse *boundedStalenessEvents) onStmtTrace(nodeIdx int, rec tracingpb.Record
 					operation:    spans[sp.ParentSpanID].Operation,
 					nodeIdx:      nodeIdx,
 					localRead:    tracing.LogsContainMsg(sp, kvbase.RoutingRequestLocallyMsg),
-					followerRead: kvtestutils.OnlyFollowerReads(rec),
+					followerRead: kv.OnlyFollowerReads(rec),
 					remoteLeaseholderRead: tracing.LogsContainMsg(sp, "[NotLeaseHolderError] lease held by different store;") &&
 						tracing.LogsContainMsg(sp, "trying next peer"),
 				})
@@ -264,12 +264,14 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 	const msg = "1μs staleness reads may actually succeed due to the slow environment"
 	skip.UnderStress(t, msg)
 	skip.UnderRace(t, msg)
-	skip.UnderDeadlock(t, msg)
 	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 
 	clusterArgs := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{},
 	}
 	const numNodes = 3
@@ -303,19 +305,6 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 		tc := testcluster.StartTestCluster(t, 3, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 
-		if tc.DefaultTenantDeploymentMode().IsExternal() {
-			// This test wants to make assertions about local requests (requests to a
-			// local replica) which is a concept that only applies to single-tenant
-			// and shared-process deployment modes. Skip for external-process
-			// multi-tenancy.
-			skip.IgnoreLint(t, "test doesn't apply to external process multi-tenancy")
-		}
-
-		require.NoError(t, tc.WaitForFullReplication())
-		tc.ToggleLeaseQueues(false)
-		tc.ToggleSplitQueues(false)
-		tc.ToggleReplicateQueues(false)
-
 		savedTraceStmt := ""
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			// Early exit non-query execution related commands.
@@ -331,7 +320,7 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 				return ""
 			}
 
-			var showEvents *bool
+			var showEvents bool
 			var waitUntilFollowerReads bool
 			var waitUntilMatch bool
 			defer func() {
@@ -358,9 +347,6 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 					serverNum, err := strconv.ParseInt(arg.Vals[0], 10, 64)
 					require.NoError(t, err)
 					dbConn = tc.ServerConn(int(serverNum))
-				case "ignore-events":
-					f := false
-					showEvents = &f
 				default:
 					t.Fatalf("unknown arg: %s", arg.Key)
 				}
@@ -377,19 +363,10 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 						return err.Error()
 					}
 					return ""
-				case "exec-system-tenant":
-					_, err := tc.SystemLayer(0).SQLConn(t).Exec(d.Input)
-					if err != nil {
-						return err.Error()
-					}
-					return ""
 				case "query":
-					// Default to showing events
-					if showEvents == nil {
-						t := true
-						showEvents = &t
-					}
+					// Always show events.
 					bse.setStmt(traceStmt)
+					showEvents = true
 					rows, err := dbConn.Query(d.Input)
 					if err != nil {
 						return err.Error()
@@ -405,7 +382,7 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 			testutils.SucceedsSoon(t, func() error {
 				ret = executeCmd()
 				// Append events to the output if desired.
-				if showEvents != nil && *showEvents {
+				if showEvents {
 					if !strings.HasSuffix(ret, "\n") {
 						ret += "\n"
 					}
