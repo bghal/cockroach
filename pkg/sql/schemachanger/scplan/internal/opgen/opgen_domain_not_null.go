@@ -22,17 +22,15 @@ func init() {
 					}
 				}),
 			),
-			// The constraint is added as NOT VALID, so no work is required to
-			// transition to VALIDATED.
-			to(scpb.Status_VALIDATED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.DomainNotNull) *scop.MakeValidatedDomainNotNullPublic {
-					return &scop.MakeValidatedDomainNotNullPublic{
+			to(scpb.Status_VALIDATED,
+				emit(func(this *scpb.DomainNotNull) *scop.ValidateDomainConstraint {
+					return &scop.ValidateDomainConstraint{
 						TypeID:       this.TypeID,
 						ConstraintID: this.ConstraintID,
 					}
 				}),
 			),
+			to(scpb.Status_PUBLIC),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
